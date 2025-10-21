@@ -1,102 +1,91 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-# ========== CHỈNH MẶC ĐỊNH TẠI ĐÂY ==========
-DEFAULT_DOMAIN="your-domain"
-# ============================================
-
-DOMAIN="${1:-${DOMAIN:-$DEFAULT_DOMAIN}}"
-echo "▶ Using DOMAIN = $DOMAIN"
-
-# 1) Cài Docker/Compose (gọn, không hỏi)
-if ! command -v docker >/dev/null 2>&1; then
-  echo "▶ Installing Docker..."
-  sudo apt-get update -y
-  sudo apt-get install -y ca-certificates curl gnupg lsb-release
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker.gpg
-  echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-  sudo apt-get update -y
-  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+# Kiểm tra quyền root
+if [[ $EUID -ne 0 ]]; then
+   echo "Script này cần chạy với quyền root"
+   exit 1
 fi
 
-# 2) Thư mục làm việc
-WORKDIR="/opt/n8n"
-sudo mkdir -p "$WORKDIR/vol_n8n"
-sudo chown -R 1000:1000 "$WORKDIR/vol_n8n"
-sudo chmod -R 755 "$WORKDIR/vol_n8n"
-cd "$WORKDIR"
+# Hàm kiểm tra domain
+check_domain() {
+    local domain=$1
+    local server_ip=$(curl -s https://api.ipify.org)
+    local domain_ip=$(dig +short $domain)
 
-# 3) Ghi .env (đầy đủ biến môi trường n8n, dùng HTTPS + domain)
-cat > .env <<EOF
-# ===== Common =====
-DOMAIN=$DOMAIN
-GENERIC_TIMEZONE=Asia/Ho_Chi_Minh
+    if [ "$domain_ip" = "$server_ip" ]; then
+        return 0  # Domain đã trỏ đúng
+    else
+        return 1  # Domain chưa trỏ đúng
+    fi
+}
 
-# ===== n8n Core =====
-# Lưu binary vào filesystem để ổn định khi chạy lâu
+# Nhận input domain từ người dùng
+read -p "Nhập domain hoặc subdomain của bạn: " DOMAIN
+
+# Kiểm tra domain
+if check_domain $DOMAIN; then
+    echo "Domain $DOMAIN đã được trỏ đúng tới server này. Tiếp tục cài đặt"
+else
+    echo "Domain $DOMAIN chưa được trỏ tới server này."
+    echo "Vui lòng cập nhật DNS để trỏ $DOMAIN tới IP $(curl -s https://api.ipify.org)"
+    echo "Sau khi cập nhật DNS, chạy lại script này"
+    exit 1
+fi
+
+# Sử dụng thư mục /home/n8n
+N8N_DIR="/home/n8n"
+
+# Cài đặt Docker và Docker Compose
+apt-get update
+apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose
+
+# Tạo thư mục cho n8n
+mkdir -p $N8N_DIR/files
+
+# Tạo file .env
+cat << 'EOF' > $N8N_DIR/.env
+N8N_HOST=$DOMAIN
+WEBHOOK_URL=https://$DOMAIN/
+WEBHOOK_TUNNEL_URL=https://$DOMAIN/
 N8N_DEFAULT_BINARY_DATA_MODE=filesystem
-
-# Cookie an toàn vì đi qua HTTPS (Caddy cấp TLS)
-N8N_SECURE_COOKIE=true
-
-# Host/URL công khai qua reverse proxy (Caddy)
-N8N_HOST=${DOMAIN}
-N8N_PROTOCOL=https
-N8N_EDITOR_BASE_URL=https://${DOMAIN}
-WEBHOOK_URL=https://${DOMAIN}/
-
-# ===== MCP (bật nếu bạn dùng multi-client/platform) =====
-N8N_MCP_ENABLED=true
-N8N_MCP_MODE=server
 EOF
 
-# 4) Ghi compose_noai.yaml (n8n + Caddy)
-cat > compose_noai.yaml <<'EOF'
-version: "3.8"
-
+# Tạo file docker-compose.yml
+cat << 'EOF' > $N8N_DIR/docker-compose.yml
 services:
   n8n:
-    image: n8nio/n8n:latest
-    restart: unless-stopped
+    image: n8nio/n8n
+    restart: always
     env_file:
       - .env
-    environment:
-      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
-      - N8N_DEFAULT_BINARY_DATA_MODE=${N8N_DEFAULT_BINARY_DATA_MODE}
-      - N8N_SECURE_COOKIE=${N8N_SECURE_COOKIE}
-      - N8N_HOST=${N8N_HOST}
-      - N8N_PROTOCOL=${N8N_PROTOCOL}
-      - N8N_EDITOR_BASE_URL=${N8N_EDITOR_BASE_URL}
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - N8N_MCP_ENABLED=${N8N_MCP_ENABLED}
-      - N8N_MCP_MODE=${N8N_MCP_MODE}
+    ports:
+      - "5678:5678"
     volumes:
-      - ./vol_n8n:/home/node/.n8n
+      - ./files:/home/node/.n8n
     networks:
-      - n8n_net
-    # Không publish port; Caddy reverse proxy vào đây
+      - n8n_network
 
   caddy:
     image: caddy:2
-    restart: unless-stopped
-    depends_on:
-      - n8n
+    restart: always
     ports:
       - "80:80"
       - "443:443"
-    environment:
-      - DOMAIN=${DOMAIN}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
       - caddy_config:/config
+    depends_on:
+      - n8n
     networks:
-      - n8n_net
+      - n8n_network
 
 networks:
-  n8n_net:
+  n8n_network:
     driver: bridge
 
 volumes:
@@ -104,20 +93,42 @@ volumes:
   caddy_config:
 EOF
 
-# 5) Ghi Caddyfile
-cat > Caddyfile <<'EOF'
-{$DOMAIN} {
+# Tạo file Caddyfile
+cat << 'EOF' > $N8N_DIR/Caddyfile
+$DOMAIN {
     reverse_proxy n8n:5678
     encode gzip
     log
 }
 EOF
 
-# 6) Khởi chạy
-echo "▶ docker compose up -d"
-docker compose -f compose_noai.yaml up -d
+# Đặt quyền cho thư mục n8n
+chown -R 1000:1000 $N8N_DIR
+chmod -R 755 $N8N_DIR
 
-echo
-echo "✅ Done. Truy cập: https://${DOMAIN}"
-echo "   Nhớ: A record của domain phải trỏ về IP máy chủ + mở cổng 80/443 để Caddy tự xin TLS."
+# Khởi động các container và kiểm tra lỗi
+cd $N8N_DIR
+docker-compose up -d
 
+# Kiểm tra trạng thái container
+echo "Kiểm tra trạng thái container..."
+sleep 10
+if docker ps -a | grep -q "n8n_n8n_1"; then
+    if docker ps | grep -q "n8n_n8n_1"; then
+        echo "Container n8n đang chạy ổn định."
+    else
+        echo "Lỗi: Container n8n không chạy. Kiểm tra log với lệnh: docker logs n8n_n8n_1"
+    fi
+else
+    echo "Lỗi: Container n8n không được tạo. Kiểm tra file docker-compose.yml và log."
+fi
+
+echo ""
+echo "╔═════════════════════════════════════════════════════════════╗"
+echo "║                                                             ║"
+echo "║  ✅ N8n đã được cài đặt (hoặc đang xử lý).                  ║"
+echo "║                                                             ║"
+echo "║  🌐 Truy cập: https://$DOMAIN                              ║"
+echo "║                                                             ║"
+echo "╚═════════════════════════════════════════════════════════════╝"
+echo ""
