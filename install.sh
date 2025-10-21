@@ -58,7 +58,7 @@ EOF
 cat << 'EOF' > $N8N_DIR/docker-compose.yml
 services:
   n8n:
-    image: n8nio/n8n
+    image: n8nio/n8n:latest
     restart: always
     env_file:
       - .env
